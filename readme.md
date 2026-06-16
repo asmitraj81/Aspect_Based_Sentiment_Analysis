@@ -1,44 +1,160 @@
-# K-Tran ABSA: Syntax-Aware Aspect-Based Sentiment Analysis
+# 🚀 Sentiment Analysis of Comments Received Through Social Media Platforms
 
-K-Tran (Knowledge-Transfer) is a sophisticated NLP model designed for **Aspect-Based Sentiment Analysis (ABSA)**. Unlike standard sentiment analysis which classifies an entire sentence, this model identifies specific "aspects" (e.g., *food*, *service*, *price*) and assigns a sentiment to each individually.
+## 📌 Overview
 
-This project implements a hybrid architecture combining the contextual power of **RoBERTa** with a custom **Syntax-Aware Transformer Encoder**.
+This project presents a Syntax-Aware Aspect-Based Sentiment Analysis (ABSA) system for analyzing user comments collected from social media platforms.
 
-## 🧠 How it Works: The Explanation
+Unlike traditional sentiment analysis, which predicts a single sentiment for an entire sentence, this system identifies specific aspects mentioned in a sentence and determines their corresponding sentiment (Positive, Negative, or Neutral).
 
-The core innovation of this project is the **K-Tran Encoder Layer**, which uses linguistic structure to improve machine learning performance.
-
-### 1. Dependency Parsing (Syntax Matrix)
-Most models treat a sentence as a flat sequence of words. This model uses **SpaCy** to perform dependency parsing. It identifies which words are grammatically linked (e.g., an adjective describing a specific noun). This is stored in a **Syntax Matrix**.
-
-
-
-### 2. Aspect-Aware Attention
-In the custom K-Tran layers, the **Syntax Matrix** is used as a "bias." During the Self-Attention mechanism, the model is mathematically "nudged" to pay more attention to words that are grammatically related. 
-* **Example:** In *"The pizza we had yesterday at the park was great,"* the model uses the syntax bias to link "great" directly to "pizza," ignoring the noise of "yesterday" or "park."
-
-### 3. Joint Task Learning
-The model performs two tasks at once:
-* **ATE (Aspect Term Extraction):** Identifying the tokens that make up an aspect (using B-I-O tagging).
-* **Sentiment Classification:** Categorizing the sentiment of those aspects into Positive, Neutral, or Negative.
+The model leverages RoBERTa for contextual language understanding and incorporates syntactic dependency information to improve aspect-level sentiment prediction.
 
 ---
 
-## 🚀 Key Features
-* **Backbone:** `roberta-base` for high-performance embeddings.
-* **Custom Layers:** 3-layer K-Tran Encoder with 8-head Aspect-Aware Attention.
-* **Optimization:** Mixed Precision Training (`autocast`) and Gradient Accumulation for efficient GPU usage.
-* **Interactive UI:** Integrated **Gradio** interface for real-time testing.
+## 🎯 Objectives
+
+- Extract aspect terms from social media comments.
+- Classify sentiment associated with each aspect.
+- Improve contextual understanding using dependency parsing.
+- Support fine-grained sentiment analysis for real-world applications.
 
 ---
 
-## 🛠️ Setup & Installation
+## 🧠 Methodology
 
-### Prerequisites
-* Python 3.8+
-* NVIDIA GPU (CUDA) recommended.
+### 1. Data Preprocessing
+- Text Cleaning
+- Tokenization
+- Dependency Parsing using SpaCy
+- Label Encoding
 
-### Installation
+### 2. Feature Extraction
+- Contextual embeddings generated using RoBERTa.
+- Syntax-aware attention bias created from dependency relations.
+
+### 3. Multi-Task Learning
+The model jointly performs:
+
+- Aspect Term Extraction (ATE)
+- Aspect Sentiment Classification (ASC)
+
+### 4. Model Architecture
+- RoBERTa Base Encoder
+- Syntax-Aware Transformer Layers
+- Multi-Head Attention
+- Classification Head
+
+---
+
+## 📊 Dataset
+
+The project utilizes:
+
+- `absa_30000.csv`
+- `Restaurants_Train.xml`
+- `Restaurants_Test_Gold.xml`
+
+Dataset contains social media and review-based sentences labeled with aspect terms and sentiment categories.
+
+### Sentiment Classes
+
+- Positive
+- Negative
+- Neutral
+
+---
+
+## 🛠️ Tech Stack
+
+### Languages
+- Python
+
+### Libraries & Frameworks
+- PyTorch
+- Transformers (Hugging Face)
+- SpaCy
+- Scikit-Learn
+- Pandas
+- NumPy
+- Gradio
+
+---
+
+## 📈 Results
+
+The proposed model demonstrated:
+
+- Improved Macro F1 Score
+- Better Aspect Extraction Performance
+- Strong Sentiment Classification Accuracy
+- Reduced Training Loss Across Epochs
+
+Evaluation Metrics:
+
+- Accuracy
+- Precision
+- Recall
+- Macro F1 Score
+- Weighted F1 Score
+- ATE F1 Score
+
+---
+
+## 📂 Project Structure
+
+```text
+.
+├── app.py
+├── absa_30000.csv
+├── Restaurants_Train.xml
+├── Restaurants_Test_Gold.xml
+├── README.md
+└── requirements.txt
+```
+
+## ▶️ Installation
+
 ```bash
-pip install transformers torch scikit-learn lxml spacy gradio
-python -m spacy download en_core_web_sm
+git clone https://github.com/asmitraj81/Aspect_Based_Sentiment_Analysis.git
+
+cd Aspect_Based_Sentiment_Analysis
+
+pip install -r requirements.txt
+```
+
+## ▶️ Run Project
+
+```bash
+python app.py
+```
+
+---
+
+## 📚 Research Contribution
+
+This work was developed as part of the research paper:
+
+**"Sentiment Analysis of Comments Received Through Social Media Platforms"**
+
+The study focuses on fine-grained sentiment understanding using Aspect-Based Sentiment Analysis techniques and syntax-aware transformer architectures.
+
+---
+
+## 👨‍💻 Authors
+
+- Asmit Raj
+
+
+
+
+## 📧 Contact
+
+**Asmit Raj**
+
+Machine Learning | NLP | Data Science
+
+GitHub: https://github.com/asmitraj81
+LinkedIn: https://linkedin.com/in/asmitraj81
+
+---
+
+⭐ If you find this project useful, consider giving it a star.

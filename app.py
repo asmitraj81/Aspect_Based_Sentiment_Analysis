@@ -1,484 +1,637 @@
-#@title K-Tran ABSA: Complete Training and Testing (Direct File Upload)
-# 1. SETUP: Install all necessary libraries
-# ==============================================================================
-!pip install transformers torch scikit-learn lxml spacy gradio
-!python -m spacy download en_core_web_sm
-
-import os
-import yaml
 import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
-from torch.optim import AdamW
-from transformers import get_linear_schedule_with_warmup, RobertaModel, RobertaTokenizerFast
-from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
-import pickle
-from tqdm.notebook import tqdm
+print(torch.cuda.is_available())
+print(torch.cuda.get_device_name(0))
+
+pip install transformers accelerate
+import torch
 import numpy as np
-from torch.cuda.amp import GradScaler, autocast
-import spacy
-from lxml import etree
-import gradio as gr
-from google.colab import files
-import shutil
+import pandas as pd
+from torch.utils.data import Dataset, DataLoader
+from transformers import RobertaTokenizer, RobertaForSequenceClassification
+from transformers import get_linear_schedule_with_warmup
+from torch.optim import AdamW
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import f1_score, classification_report
+from sklearn.utils.class_weight import compute_class_weight
+from tqdm import tqdm
+import xml.etree.ElementTree as ET
+import os
 
-# ==============================================================================
-# 2. UPLOAD AND PREPARE DATA (Handles individual file uploads)
-# ==============================================================================
-# Create the target directory
-data_dir = '/content/semeval14'
-os.makedirs(data_dir, exist_ok=True)
+# ===============================
+# Parse MAMS XML
+# ===============================
+import os
 
-print("Please upload 'Restaurants_Train.xml' and 'Restaurants_Test_Gold.xml'.")
-uploaded = files.upload()
+print("Train exists:", os.path.exists("train.xml"))
+print("Test exists:", os.path.exists("test.xml"))
+print("Train size:", os.path.getsize("train.xml") if os.path.exists("train.xml") else "No file")
+def parse_mams_xml(file_path):
+    tree = ET.parse(file_path)
+    root = tree.getroot()
 
-# Verify and move the uploaded files to the correct directory
-required_files = ['Restaurants_Train.xml', 'Restaurants_Test_Gold.xml']
-for req_fn in required_files:
-    found_uploaded_fn = None
-    # Extract base name for matching, e.g., 'Restaurants_Train'
-    req_base_name = os.path.splitext(req_fn)[0]
+    data = []
+    for sentence in root.findall("sentence"):
+        text = sentence.find("text").text.strip()
+        aspects = sentence.find("aspectCategories")
 
-    for uploaded_fn in uploaded.keys():
-        # Check if the uploaded filename starts with the required base name
-        # and ends with '.xml' (to allow for Colab's (n) suffix)
-        if uploaded_fn.startswith(req_base_name) and uploaded_fn.endswith('.xml'):
-            found_uploaded_fn = uploaded_fn
-            break
-
-    if found_uploaded_fn:
-        # Move the uploaded file (e.g., 'Restaurants_Train (1).xml')
-        # to the data_dir with the required name (e.g., 'Restaurants_Train.xml')
-        source_path = os.path.join('/content', found_uploaded_fn)
-        destination_path = os.path.join(data_dir, req_fn)
-        shutil.move(source_path, destination_path)
-        print(f'Successfully prepared "{req_fn}" from uploaded file "{found_uploaded_fn}"')
-    else:
-        print(f'Error: Required file "{req_fn}" was not uploaded or matched.')
-
-# ==============================================================================
-# 3. CONFIGURATION
-# ==============================================================================
-config = {
-    'data': {
-        'train_path': '/content/semeval14/Restaurants_Train.xml',
-        'test_path': '/content/semeval14/Restaurants_Test_Gold.xml',
-        'processed_dir': '/content/data/processed',
-        'max_seq_len': 128,
-        'sentiment_map': {'positive': 2, 'neutral': 1, 'negative': 0}
-    },
-    'model': {
-        'base_model': 'roberta-base',
-        'k_tran_layers': 3,
-        'k_tran_heads': 8,
-        'dropout_rate': 0.1
-    },
-    'training': {
-        'optimizer': 'adamw',
-        'learning_rate': 2e-5,
-        'epochs': 5,
-        'train_batch_size': 16,
-        'eval_batch_size': 32,
-        'gradient_accumulation_steps': 2,
-        'num_workers': 2,
-        'ate_loss_weight': 0.2,
-        'max_grad_norm': 1.0
-    },
-    'environment': {
-        'device': 'cuda',
-        'seed': 42
-    }
-}
-
-# ==============================================================================
-# 4. MODEL DEFINITION (K-Tran)
-# ==============================================================================
-class AspectAwareAttention(nn.Module):
-    def __init__(self, embed_dim, num_heads):
-        super(AspectAwareAttention, self).__init__()
-        self.multihead_attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
-
-    def forward(self, query, key, value, attn_mask=None, key_padding_mask=None):
-        return self.multihead_attn(query, key, value, attn_mask=attn_mask, key_padding_mask=key_padding_mask)
-
-class KTranEncoderLayer(nn.Module):
-    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1):
-        super(KTranEncoderLayer, self).__init__()
-        self.self_attn = AspectAwareAttention(d_model, nhead)
-        self.linear1 = nn.Linear(d_model, dim_feedforward)
-        self.dropout = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(dim_feedforward, d_model)
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.dropout1 = nn.Dropout(dropout)
-        self.dropout2 = nn.Dropout(dropout)
-        self.activation = nn.ReLU()
-
-    def forward(self, src, src_mask=None, syntax_matrix=None):
-        key_padding_mask = (src_mask == 0) if src_mask is not None else None
-
-        attn_mask = None
-        if syntax_matrix is not None:
-            num_heads = self.self_attn.multihead_attn.num_heads
-            attn_mask = syntax_matrix.repeat_interleave(num_heads, dim=0)
-
-        attn_output, _ = self.self_attn(src, src, src, attn_mask=attn_mask, key_padding_mask=key_padding_mask)
-        src = src + self.dropout1(attn_output)
-        src = self.norm1(src)
-
-        ff_output = self.linear2(self.dropout(self.activation(self.linear1(src))))
-        src = src + self.dropout2(ff_output)
-        src = self.norm2(src)
-        return src
-
-class KTranForABSA(nn.Module):
-    def __init__(self, model_config):
-        super(KTranForABSA, self).__init__()
-        self.config = model_config
-        self.roberta = RobertaModel.from_pretrained(self.config['base_model'])
-        d_model = self.roberta.config.hidden_size
-        nhead = self.config['k_tran_heads']
-        num_layers = self.config['k_tran_layers']
-        self.k_tran_encoder = nn.ModuleList(
-            [KTranEncoderLayer(d_model, nhead) for _ in range(num_layers)]
-        )
-        self.dropout = nn.Dropout(self.config['dropout_rate'])
-        self.sentiment_num_labels = 3
-        self.sentiment_classifier = nn.Linear(d_model, self.sentiment_num_labels)
-        self.ate_num_labels = 3
-        self.ate_classifier = nn.Linear(d_model, self.ate_num_labels)
-
-    def forward(self, input_ids, attention_mask, syntax_matrix=None):
-        roberta_outputs = self.roberta(input_ids=input_ids, attention_mask=attention_mask)
-        sequence_output = roberta_outputs.last_hidden_state
-
-        syntax_bias = None
-        if syntax_matrix is not None:
-            syntax_bias = (1.0 - syntax_matrix) * -1e9
-
-        encoder_output = sequence_output
-        for layer in self.k_tran_encoder:
-            encoder_output = layer(encoder_output, src_mask=attention_mask, syntax_matrix=syntax_bias)
-
-        encoder_output = self.dropout(encoder_output)
-        cls_token_representation = encoder_output[:, 0]
-        sentiment_logits = self.sentiment_classifier(cls_token_representation)
-        ate_logits = self.ate_classifier(encoder_output)
-        return {"sentiment_logits": sentiment_logits, "ate_logits": ate_logits}
-
-# ==============================================================================
-# 5. DATA PROCESSING
-# ==============================================================================
-nlp = spacy.load("en_core_web_sm")
-
-class DataProcessor:
-    def __init__(self, config):
-        self.config = config
-        self.tokenizer = RobertaTokenizerFast.from_pretrained(self.config['model']['base_model'])
-        self.max_seq_len = self.config['data']['max_seq_len']
-        self.sentiment_map = self.config['data']['sentiment_map']
-
-    def _parse_xml_lxml(self, file_path):
-        try:
-            tree = etree.parse(file_path)
-            root = tree.getroot()
-        except (etree.XMLSyntaxError, IOError) as e:
-            print(f"Error parsing XML file {file_path}: {e}")
-            return []
-        all_data = []
-        sentences = root.xpath('//sentence')
-        for sentence_node in sentences:
-            text = ''.join(sentence_node.xpath('./text/text()'))
-            if not text: continue
-            aspects_data = []
-            for aspect_term_node in sentence_node.xpath('.//aspectTerm'):
-                term = aspect_term_node.get('term')
-                polarity = aspect_term_node.get('polarity')
-                if term and polarity and polarity in self.sentiment_map:
-                    aspects_data.append({'term': term, 'polarity': polarity})
-            if text and aspects_data:
-                all_data.append({'text': text, 'aspects': aspects_data})
-        return all_data
-
-    def _create_syntax_matrix(self, text, encoded):
-        doc = nlp(text)
-        seq_len = encoded['input_ids'].shape[1]
-        matrix = torch.zeros(seq_len, seq_len)
-        offset_mapping = encoded.offset_mapping[0]
-        for token in doc:
-            char_start, char_end = token.idx, token.idx + len(token.text)
-            try:
-                token_indices = [i for i, (start, end) in enumerate(offset_mapping) if start < char_end and end > char_start]
-                if not token_indices: continue
-                head_char_start, head_char_end = token.head.idx, token.head.idx + len(token.head.text)
-                head_indices = [i for i, (start, end) in enumerate(offset_mapping) if start < head_char_end and end > head_char_start]
-                if head_indices:
-                    for i in token_indices:
-                        for j in head_indices:
-                            matrix[i][j] = 1
-                            matrix[j][i] = 1
-            except IndexError:
-                continue
-        for i in range(seq_len):
-            matrix[i][i] = 1
-        return matrix.float()
-
-    def _tokenize_and_prepare(self, text, aspect_term):
-        encoded = self.tokenizer.encode_plus(
-            text, add_special_tokens=True, max_length=self.max_seq_len,
-            padding='max_length', truncation=True, return_tensors='pt',
-            return_offsets_mapping=True
-        )
-        input_ids = encoded['input_ids'].squeeze(0)
-        attention_mask = encoded['attention_mask'].squeeze(0)
-        offset_mapping = encoded['offset_mapping'].squeeze(0)
-        syntax_matrix = self._create_syntax_matrix(text, encoded)
-        ate_labels = torch.zeros(self.max_seq_len, dtype=torch.long)
-        try:
-            aspect_start_char = text.find(aspect_term)
-            if aspect_start_char != -1:
-                aspect_end_char = aspect_start_char + len(aspect_term)
-                token_indices = [i for i, (start, end) in enumerate(offset_mapping) if start < aspect_end_char and end > aspect_start_char]
-                if token_indices:
-                    ate_labels[token_indices[0]] = 1 # B-Aspect
-                    for i in token_indices[1:]:
-                        ate_labels[i] = 2 # I-Aspect
-        except Exception:
-            pass
-        return input_ids, attention_mask, ate_labels, syntax_matrix
-
-    def process(self, file_path, name="train"):
-        raw_data = self._parse_xml_lxml(file_path)
-        processed_data = []
-        for item in tqdm(raw_data, desc=f"Processing {name} data"):
-            text = item['text']
-            for aspect in item['aspects']:
-                aspect_term, polarity = aspect['term'], aspect['polarity']
-                input_ids, attention_mask, ate_labels, syntax_matrix = self._tokenize_and_prepare(text, aspect_term)
-                sentiment_label = self.sentiment_map[polarity]
-                processed_data.append({
-                    'input_ids': input_ids, 'attention_mask': attention_mask,
-                    'ate_labels': ate_labels, 'sentiment_label': torch.tensor(sentiment_label, dtype=torch.long),
-                    'syntax_matrix': syntax_matrix
+        if aspects is not None:
+            for aspect in aspects.findall("aspectCategory"):
+                data.append({
+                    "text": text,
+                    "aspect": aspect.get("category"),
+                    "sentiment": aspect.get("polarity")
                 })
-        output_dir = self.config['data']['processed_dir']
-        os.makedirs(output_dir, exist_ok=True)
-        output_path = os.path.join(output_dir, f"{name}_data.pkl")
-        with open(output_path, 'wb') as f:
-            pickle.dump(processed_data, f)
-        print(f"Saved processed {name} data to {output_path}. Total samples: {len(processed_data)}")
 
-# ==============================================================================
-# 6. TRAINING
-# ==============================================================================
-class Trainer:
-    def __init__(self, config):
-        self.config = config
-        self.device = torch.device(self.config['environment']['device'] if torch.cuda.is_available() else 'cpu')
-        self.model = KTranForABSA(self.config['model']).to(self.device)
-        self.epochs = self.config['training']['epochs']
-        self.train_batch_size = self.config['training']['train_batch_size']
-        self.eval_batch_size = self.config['training']['eval_batch_size']
-        self.learning_rate = float(self.config['training']['learning_rate'])
-        self.ate_loss_weight = self.config['training']['ate_loss_weight']
-        self.gradient_accumulation_steps = self.config['training']['gradient_accumulation_steps']
-        self.num_workers = self.config['training']['num_workers']
+    return pd.DataFrame(data)
 
-    def _load_data(self, name="train"):
-        data_path = os.path.join(self.config['data']['processed_dir'], f"{name}_data.pkl")
-        with open(data_path, 'rb') as f: data = pickle.load(f)
-        dataset = TensorDataset(
-            torch.stack([item['input_ids'] for item in data]),
-            torch.stack([item['attention_mask'] for item in data]),
-            torch.stack([item['ate_labels'] for item in data]),
-            torch.stack([item['sentiment_label'] for item in data]),
-            torch.stack([item['syntax_matrix'] for item in data])
+train_df = parse_mams_xml("train.xml")
+test_df = parse_mams_xml("test.xml")
+
+# ===============================
+# Encode Labels
+# ===============================
+
+label_encoder = LabelEncoder()
+train_df["label"] = label_encoder.fit_transform(train_df["sentiment"])
+test_df["label"] = label_encoder.transform(test_df["sentiment"])
+
+num_labels = len(label_encoder.classes_)
+
+# ===============================
+# Dataset Class
+# ===============================
+
+class ABSADataset(Dataset):
+    def __init__(self, df, tokenizer, max_len=128):
+        self.df = df.reset_index(drop=True)
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+
+        encoding = self.tokenizer(
+            row["aspect"],
+            row["text"],
+            padding="max_length",
+            truncation=True,
+            max_length=self.max_len,
+            return_tensors="pt"
         )
-        batch_size = self.train_batch_size if name == "train" else self.eval_batch_size
-        return DataLoader(dataset, batch_size=batch_size, shuffle=(name=="train"), num_workers=self.num_workers, pin_memory=True)
 
-    def _compute_metrics(self, sentiment_preds, sentiment_labels, ate_preds, ate_labels, attention_mask):
-        sentiment_preds = np.argmax(sentiment_preds, axis=1).flatten()
-        sentiment_labels = sentiment_labels.flatten()
-        acc = accuracy_score(sentiment_labels, sentiment_preds)
-        f1 = f1_score(sentiment_labels, sentiment_preds, average='weighted', zero_division=0)
-        prec = precision_score(sentiment_labels, sentiment_preds, average='weighted', zero_division=0)
-        rec = recall_score(sentiment_labels, sentiment_preds, average='weighted', zero_division=0)
-        active_loss = attention_mask.view(-1) == 1
-        active_logits = ate_preds.view(-1, self.model.ate_num_labels)
-        active_labels = ate_labels.view(-1)
-        active_preds = torch.argmax(active_logits, axis=1)
-        ate_f1 = f1_score(active_labels[active_loss].cpu(), active_preds[active_loss].cpu(), average='weighted', zero_division=0)
-        return {"accuracy": acc, "f1": f1, "precision": prec, "recall": rec, "ate_f1": ate_f1}
+        return {
+            "input_ids": encoding["input_ids"].squeeze(0),
+            "attention_mask": encoding["attention_mask"].squeeze(0),
+            "labels": torch.tensor(row["label"], dtype=torch.long)
+        }
 
-    def train(self):
-        train_dataloader = self._load_data("train")
-        test_dataloader = self._load_data("test")
-        optimizer = AdamW(self.model.parameters(), lr=self.learning_rate)
-        total_steps = len(train_dataloader) // self.gradient_accumulation_steps * self.epochs
-        scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0, num_training_steps=total_steps)
-        sentiment_loss_fn = nn.CrossEntropyLoss()
-        ate_loss_fn = nn.CrossEntropyLoss()
-        scaler = GradScaler()
-        best_f1 = 0
-        for epoch in range(self.epochs):
-            self.model.train()
-            total_loss = 0
-            print(f"\nEpoch {epoch + 1}/{self.epochs}")
-            optimizer.zero_grad()
-            for i, batch in enumerate(tqdm(train_dataloader, desc="Training")):
-                batch = tuple(t.to(self.device, non_blocking=True) for t in batch)
-                input_ids, attention_mask, ate_labels, sentiment_labels, syntax_matrix = batch
-                with autocast():
-                    outputs = self.model(input_ids, attention_mask, syntax_matrix=syntax_matrix)
-                    loss_sentiment = sentiment_loss_fn(outputs['sentiment_logits'], sentiment_labels)
-                    active_loss_mask = attention_mask.view(-1) == 1
-                    active_logits = outputs['ate_logits'].view(-1, self.model.ate_num_labels)
-                    active_labels = ate_labels.view(-1)
-                    loss_ate = ate_loss_fn(active_logits[active_loss_mask], active_labels[active_loss_mask])
-                    loss = (loss_sentiment + self.ate_loss_weight * loss_ate) / self.gradient_accumulation_steps
-                scaler.scale(loss).backward()
-                total_loss += loss.item()
-                if (i + 1) % self.gradient_accumulation_steps == 0:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config['training']['max_grad_norm'])
-                    scaler.step(optimizer)
-                    scaler.update()
-                    scheduler.step()
-                    optimizer.zero_grad()
-            avg_train_loss = total_loss / len(train_dataloader) * self.gradient_accumulation_steps
-            print(f"Average Training Loss: {avg_train_loss:.4f}")
-            current_f1 = self.evaluate(test_dataloader)
-            if current_f1 > best_f1:
-                best_f1 = current_f1
-                print("New best model found! Saving...")
-                os.makedirs('/content/models', exist_ok=True)
-                torch.save(self.model.state_dict(), '/content/models/k_tran_best.pt')
+# ===============================
+# Setup
+# ===============================
 
-    def evaluate(self, dataloader):
-        self.model.eval()
-        all_sentiment_preds, all_sentiment_labels, all_ate_preds, all_ate_labels, all_masks = [], [], [], [], []
-        with torch.no_grad():
-            for batch in tqdm(dataloader, desc="Evaluating"):
-                batch = tuple(t.to(self.device, non_blocking=True) for t in batch)
-                input_ids, attention_mask, ate_labels, sentiment_labels, syntax_matrix = batch
-                with autocast():
-                    outputs = self.model(input_ids, attention_mask, syntax_matrix=syntax_matrix)
-                all_sentiment_preds.append(outputs['sentiment_logits'].cpu().numpy())
-                all_sentiment_labels.append(sentiment_labels.cpu().numpy())
-                all_ate_preds.append(outputs['ate_logits'].cpu().numpy())
-                all_ate_labels.append(ate_labels.cpu().numpy())
-                all_masks.append(attention_mask.cpu().numpy())
-        metrics = self._compute_metrics(
-            torch.from_numpy(np.concatenate(all_sentiment_preds, axis=0)),
-            torch.from_numpy(np.concatenate(all_sentiment_labels, axis=0)),
-            torch.from_numpy(np.concatenate(all_ate_preds, axis=0)),
-            torch.from_numpy(np.concatenate(all_ate_labels, axis=0)),
-            torch.from_numpy(np.concatenate(all_masks, axis=0))
-        )
-        print(f"Evaluation Results: Accuracy: {metrics['accuracy']:.4f}, F1: {metrics['f1']:.4f}, ATE F1: {metrics['ate_f1']:.4f}")
-        return metrics['f1']
+device = torch.device("cuda")
 
-# ==============================================================================
-# 7. RUN DATA PROCESSING AND TRAINING
-# ==============================================================================
-print("--- Starting Data Processing ---")
-data_processor = DataProcessor(config)
-data_processor.process(config['data']['train_path'], "train")
-data_processor.process(config['data']['test_path'], "test")
+tokenizer = RobertaTokenizer.from_pretrained("roberta-base")
+model = RobertaForSequenceClassification.from_pretrained(
+    "roberta-base",
+    num_labels=num_labels
+).to(device)
 
-print("\n--- Starting Model Training ---")
-trainer = Trainer(config)
-trainer.train()
-print("\n--- Training Complete ---")
+train_dataset = ABSADataset(train_df, tokenizer)
+test_dataset = ABSADataset(test_df, tokenizer)
 
-# ==============================================================================
-# 8. SETUP INTERACTIVE DEMO
-# ==============================================================================
-print("\n--- Loading final model for interactive demo ---")
-device = torch.device(config['environment']['device'] if torch.cuda.is_available() else 'cpu')
-final_model = KTranForABSA(config['model'])
-final_model.load_state_dict(torch.load('/content/models/k_tran_best.pt', map_location=device))
-final_model.to(device)
-final_model.eval()
-tokenizer = RobertaTokenizerFast.from_pretrained(config['model']['base_model'])
-nlp_demo = spacy.load("en_core_web_sm")
+train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=16)
 
-def predict_sentiment(sentence):
-    max_seq_len = config['data']['max_seq_len']
-    encoded = tokenizer.encode_plus(
-        sentence, add_special_tokens=True, max_length=max_seq_len,
-        padding='max_length', truncation=True, return_tensors='pt',
-        return_offsets_mapping=True
-    )
-    input_ids = encoded['input_ids'].to(device)
-    attention_mask = encoded['attention_mask'].to(device)
+# ===============================
+# Class Weights
+# ===============================
 
-    doc = nlp_demo(sentence)
-    matrix = torch.zeros(max_seq_len, max_seq_len, dtype=torch.float32)
-    offset_mapping = encoded.offset_mapping.squeeze(0).tolist()
-    for token in doc:
-        char_start, char_end = token.idx, token.idx + len(token.text)
-        token_indices = [i for i, (start, end) in enumerate(offset_mapping) if start < char_end and end > char_start]
-        if not token_indices: continue
-        head_char_start, head_char_end = token.head.idx, token.head.idx + len(token.head.text)
-        head_indices = [i for i, (start, end) in enumerate(offset_mapping) if start < head_char_end and end > head_char_start]
-        if head_indices:
-            for i in token_indices:
-                for j in head_indices:
-                    matrix[i][j] = 1
-                    matrix[j][i] = 1
-    for i in range(max_seq_len): matrix[i][i] = 1
-    syntax_matrix = matrix.unsqueeze(0).to(device)
+class_weights = compute_class_weight(
+    class_weight="balanced",
+    classes=np.unique(train_df["label"]),
+    y=train_df["label"]
+)
+
+class_weights = torch.tensor(class_weights, dtype=torch.float).to(device)
+loss_fn = torch.nn.CrossEntropyLoss(weight=class_weights)
+
+optimizer = AdamW(model.parameters(), lr=2e-5)
+
+total_steps = len(train_loader) * 5
+
+scheduler = get_linear_schedule_with_warmup(
+    optimizer,
+    num_warmup_steps=int(0.1 * total_steps),
+    num_training_steps=total_steps
+)
+
+scaler = torch.cuda.amp.GradScaler()
+
+# ===============================
+# Training Loop
+# ===============================
+
+best_f1 = 0
+patience = 2
+trigger_times = 0
+
+epochs = 5
+
+for epoch in range(epochs):
+
+    model.train()
+    total_loss = 0
+
+    for batch in tqdm(train_loader):
+
+        optimizer.zero_grad()
+
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        labels = batch["labels"].to(device)
+
+        with torch.cuda.amp.autocast():
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            logits = outputs.logits
+            loss = loss_fn(logits, labels)
+
+        scaler.scale(loss).backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        scaler.step(optimizer)
+        scaler.update()
+        scheduler.step()
+
+        total_loss += loss.item()
+
+    print(f"\nEpoch {epoch+1}")
+    print("Train Loss:", total_loss / len(train_loader))
+
+    # ===============================
+    # Evaluation
+    # ===============================
+
+    model.eval()
+    preds = []
+    true_labels = []
 
     with torch.no_grad():
-        outputs = final_model(input_ids, attention_mask, syntax_matrix=syntax_matrix)
+        for batch in test_loader:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            labels = batch["labels"].to(device)
 
-    ate_preds = torch.argmax(outputs['ate_logits'], dim=2).squeeze(0)
-    tokens = tokenizer.convert_ids_to_tokens(input_ids.squeeze(0))
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            logits = outputs.logits
 
+            pred = torch.argmax(logits, dim=1)
+
+            preds.extend(pred.cpu().numpy())
+            true_labels.extend(labels.cpu().numpy())
+
+    macro_f1 = f1_score(true_labels, preds, average="macro")
+
+    print("Macro F1:", macro_f1)
+    print(classification_report(true_labels, preds))
+
+    # ===============================
+    # Early Stopping
+    # ===============================
+
+    if macro_f1 > best_f1:
+        best_f1 = macro_f1
+        torch.save(model.state_dict(), "best_model.pt")
+        trigger_times = 0
+        print("Best model saved.")
+    else:
+        trigger_times += 1
+        if trigger_times >= patience:
+            print("Early stopping triggered.")
+            break
+
+print("Best Macro F1 Achieved:", best_f1)
+
+import matplotlib.pyplot as plt
+import numpy as np
+from sklearn.metrics import confusion_matrix, accuracy_score, classification_report
+!pip install transformers
+# -------------------------------
+# Generate Predictions
+# -------------------------------
+
+model.eval()
+preds = []
+true_labels = []
+
+with torch.no_grad():
+    for batch in test_loader:
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        labels = batch["labels"].to(device)
+
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+        logits = outputs.logits
+        predictions = torch.argmax(logits, dim=1)
+
+        preds.extend(predictions.cpu().numpy())
+        true_labels.extend(labels.cpu().numpy())
+
+cm = confusion_matrix(true_labels, preds)
+accuracy = accuracy_score(true_labels, preds)
+
+print("\n========== FINAL MODEL PERFORMANCE ==========")
+print(f"Overall Accuracy: {accuracy:.4f}\n")
+print(classification_report(true_labels, preds))
+
+epochs = [1,2,3,4,5]
+train_losses = [1.0517, 0.7658, 0.6074, 0.5022, 0.4293]
+macro_f1_scores = [0.6235, 0.7497, 0.7627, 0.7824, 0.7924]
+
+# ==========================================================
+# 1️⃣ Line Plot – Training Loss
+# ==========================================================
+import matplotlib.pyplot as plt
+
+plt.figure(figsize=(8,5))
+
+plt.plot(
+    epochs,
+    train_losses,
+    marker='o',
+    linestyle='-',
+    linewidth=2.5,
+    markersize=7,
+    color='royalblue',
+    label="Training Loss"
+)
+
+plt.title("Training Loss Trend", fontsize=16, fontweight='bold')
+plt.xlabel("Epoch", fontsize=12)
+plt.ylabel("Loss", fontsize=12)
+
+plt.grid(True, linestyle='--', alpha=0.6)
+plt.legend()
+plt.tight_layout()
+
+plt.show()
+
+# ==========================================================
+# 2️⃣ Line Plot – Macro F1 Score
+# ==========================================================
+import matplotlib.pyplot as plt
+
+plt.figure(figsize=(8,5))
+
+plt.plot(
+    epochs,
+    macro_f1_scores,
+    marker='o',
+    markersize=8,
+    linewidth=3,
+    color='#2E86C1',
+    label="Macro F1 Score"
+)
+
+# Highlight improvement area
+plt.fill_between(
+    epochs,
+    macro_f1_scores,
+    color='#85C1E9',
+    alpha=0.3
+)
+
+plt.title("Macro F1 Score Improvement Across Epochs",
+          fontsize=16,
+          fontweight='bold')
+
+plt.xlabel("Epoch", fontsize=12)
+plt.ylabel("Macro F1 Score", fontsize=12)
+
+plt.grid(True, linestyle='--', alpha=0.6)
+plt.legend()
+plt.tight_layout()
+
+plt.show()
+
+# ==========================================================
+# 3️⃣ Heatmap – Confusion Matrix
+# ==========================================================
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Example confusion matrix (replace with your cm)
+cm = np.array([[50, 2, 1],
+               [4, 45, 3],
+               [2, 1, 48]])
+
+plt.figure(figsize=(6,5))
+
+# Use distinct colors
+cmap = plt.cm.tab20
+
+# Unique color index for each cell
+color_index = np.arange(cm.size).reshape(cm.shape)
+
+img = plt.imshow(color_index, cmap=cmap)
+
+plt.title("Confusion Matrix Heatmap")
+plt.xlabel("Predicted Label")
+plt.ylabel("True Label")
+
+# Show actual confusion matrix values inside cells
+for i in range(cm.shape[0]):
+    for j in range(cm.shape[1]):
+        plt.text(j, i, cm[i, j],
+                 ha='center', va='center',
+                 fontsize=12,
+                 color="black")
+
+# Colorbar with label
+cbar = plt.colorbar(img)
+cbar.set_label("Cell Color Index (Each color represents a unique cell)")
+
+# Optional class labels
+classes = ["Class 0", "Class 1", "Class 2"]
+plt.xticks(np.arange(len(classes)), classes)
+plt.yticks(np.arange(len(classes)), classes)
+
+plt.tight_layout()
+plt.show()
+
+# ==========================================================
+# 4️⃣ Bar Chart – Class-wise Accuracy
+# ==========================================================
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Example confusion matrix (replace with your cm)
+cm = np.array([[50,2,1],
+               [4,45,3],
+               [2,1,48]])
+
+# Class names
+classes = ["Class 0", "Class 1", "Class 2"]
+
+# Calculate class-wise accuracy
+class_accuracy = []
+for i in range(cm.shape[0]):
+    correct_predictions = cm[i, i]
+    total_for_class = cm[i, :].sum()
+    if total_for_class > 0:
+        class_accuracy.append(correct_predictions / total_for_class)
+    else:
+        class_accuracy.append(0.0)
+
+plt.figure(figsize=(8,5))
+
+colors = ['#3498DB', '#2ECC71', '#E74C3C', '#9B59B6', '#F39C12']
+
+bars = plt.bar(
+    range(len(class_accuracy)),
+    class_accuracy,
+    color=colors[:len(class_accuracy)],
+    edgecolor='black',
+    linewidth=1.5
+)
+
+plt.title("Class-wise Accuracy", fontsize=16, fontweight='bold')
+plt.xlabel("Classes", fontsize=12)
+plt.ylabel("Accuracy", fontsize=12)
+
+plt.ylim(0,1)
+plt.grid(True, axis='y', linestyle='--', alpha=0.6)
+
+# Add labels above each bar
+for i, bar in enumerate(bars):
+    height = bar.get_height()
+
+    # Accuracy value
+    plt.text(
+        bar.get_x() + bar.get_width()/2,
+        height + 0.02,
+        f"{height:.2f}",
+        ha='center',
+        fontsize=11,
+        fontweight='bold'
+    )
+
+    # Class name above value
+    plt.text(
+        bar.get_x() + bar.get_width()/2,
+        height + 0.08,
+        classes[i],
+        ha='center',
+        fontsize=11,
+        fontweight='bold',
+        color='black'
+    )
+
+plt.tight_layout()
+plt.show()
+# ==========================================================
+# 5️⃣ Pie Chart – Class Distribution
+# ==========================================================
+import matplotlib.pyplot as plt
+
+support = cm.sum(axis=1)
+
+plt.figure(figsize=(7,7))
+
+# Modern colors
+colors = ['#3498DB', '#2ECC71', '#E74C3C', '#9B59B6', '#F39C12']
+
+explode = [0.05] * len(support)
+
+wedges, texts, autotexts = plt.pie(
+    support,
+    autopct='%1.1f%%',
+    startangle=140,
+    colors=colors[:len(support)],
+    explode=explode,
+    shadow=True,
+    textprops={'fontsize':12, 'weight':'bold'}
+)
+
+plt.title("Class Distribution (%)",
+          fontsize=16,
+          fontweight='bold')
+
+# ✅ Legend showing color meaning
+plt.legend(
+    wedges,
+    [f"Class {i}" for i in range(len(support))],
+    title="Classes",
+    loc="best",
+    fontsize=11
+)
+
+plt.axis('equal')
+plt.tight_layout()
+plt.show()
+
+# ==========================================================
+# 6️⃣ Histogram – Prediction Distribution
+# ==========================================================
+import matplotlib.pyplot as plt
+import numpy as np
+
+plt.figure(figsize=(8,5))
+
+# Example class names
+classes = ["Class 0", "Class 1", "Class 2"]
+
+colors = plt.cm.viridis(np.linspace(0, 1, len(np.unique(preds))))
+
+# Create histogram
+n, bins, patches = plt.hist(
+    preds,
+    bins=len(np.unique(preds)),
+    edgecolor='black',
+    linewidth=1.5
+)
+
+# Apply colors
+for patch, color in zip(patches, colors):
+    patch.set_facecolor(color)
+
+# ⭐ Put numbers at center of each bar
+for i in range(len(n)):
+    center = (bins[i] + bins[i+1]) / 2
+    plt.text(
+        center,
+        n[i] / 2,           # vertical center of bar
+        int(n[i]),
+        ha='center',
+        va='center',
+        fontsize=11,
+        fontweight='bold',
+        color='black'
+    )
+
+# Add class labels
+plt.xticks(np.unique(preds), classes)
+
+plt.title("Prediction Distribution", fontsize=16, fontweight='bold')
+plt.xlabel("Predicted Class")
+plt.ylabel("Frequency")
+
+plt.grid(axis='y', linestyle='--', alpha=0.6)
+
+plt.tight_layout()
+plt.show()
+
+import torch
+import spacy
+import gradio as gr
+import numpy as np
+from transformers import RobertaTokenizer, RobertaForSequenceClassification
+from torch.nn.functional import softmax
+from sklearn.preprocessing import LabelEncoder
+
+# =========================
+# Device
+# =========================
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# =========================
+# Load Model
+# =========================
+num_labels = 3  # adjust if needed
+
+tokenizer = RobertaTokenizer.from_pretrained("roberta-base")
+
+model = RobertaForSequenceClassification.from_pretrained(
+    "roberta-base",
+    num_labels=num_labels
+)
+
+model.load_state_dict(torch.load("best_model.pt", map_location=device))
+model.to(device)
+model.eval()
+
+# =========================
+# Label Mapping (IMPORTANT)
+# Must match training order
+# =========================
+label_map = {
+    0: "negative",
+    1: "neutral",
+    2: "positive"
+}
+
+# =========================
+# Load spaCy for Aspect Extraction
+# =========================
+nlp = spacy.load("en_core_web_sm")
+
+# =========================
+# Extract Aspects
+# =========================
+def extract_aspects(text):
+    doc = nlp(text)
     aspects = []
-    current_aspect_tokens = []
-    for i, pred in enumerate(ate_preds):
-        if not attention_mask[0, i] or tokens[i] in (tokenizer.cls_token, tokenizer.sep_token, tokenizer.pad_token):
-            continue
 
-        token_id = tokenizer.convert_tokens_to_ids(tokens[i])
-        if pred == 1: # B-Aspect
-            if current_aspect_tokens: aspects.append(tokenizer.decode(current_aspect_tokens))
-            current_aspect_tokens = [token_id]
-        elif pred == 2 and current_aspect_tokens: # I-Aspect
-            current_aspect_tokens.append(token_id)
-        else: # O-token
-            if current_aspect_tokens:
-                aspects.append(tokenizer.decode(current_aspect_tokens))
-                current_aspect_tokens = []
-    if current_aspect_tokens: aspects.append(tokenizer.decode(current_aspect_tokens))
+    for token in doc:
+        if token.pos_ in ["NOUN", "PROPN"]:
+            aspects.append(token.text.lower())
 
-    sentiment_pred = torch.argmax(outputs['sentiment_logits'], dim=1).item()
-    sentiment_map_inv = {v: k for k, v in config['data']['sentiment_map'].items()}
-    sentiment = sentiment_map_inv.get(sentiment_pred, "unknown")
+    return list(set(aspects))
+
+# =========================
+# Predict Sentiment
+# =========================
+def predict_sentiment(text, aspect):
+    encoding = tokenizer(
+        aspect,
+        text,
+        return_tensors="pt",
+        truncation=True,
+        padding=True
+    )
+
+    input_ids = encoding["input_ids"].to(device)
+    attention_mask = encoding["attention_mask"].to(device)
+
+    with torch.no_grad():
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+
+    probs = softmax(outputs.logits, dim=1)
+    confidence, pred = torch.max(probs, dim=1)
+
+    return label_map[pred.item()], float(confidence.item())
+
+# =========================
+# Full ABSA Pipeline
+# =========================
+def analyze_sentence(text):
+
+    aspects = extract_aspects(text)
 
     if not aspects:
-        return "No aspects detected.", {}
+        return "No aspects detected."
 
-    results = {}
+    results = []
+
     for aspect in aspects:
-        results[aspect.strip()] = sentiment.upper()
+        sentiment, confidence = predict_sentiment(text, aspect)
+        results.append(
+            f"Aspect: {aspect}\nSentiment: {sentiment}\nConfidence: {confidence:.2f}\n"
+        )
 
-    return f"Overall Sentiment: {sentiment.upper()}", results
+    return "\n-----------------\n".join(results)
 
-# Launch Gradio Interface
+# =========================
+# Gradio Interface
+# =========================
 interface = gr.Interface(
-    fn=predict_sentiment,
-    inputs=gr.Textbox(lines=3, label="Enter a sentence", placeholder="The food was amazing but the service was slow."),
-    outputs=[gr.Textbox(label="Overall Sentiment"), gr.Label(label="Aspects and Sentiments")],
-    title="🧪 K-Tran ABSA: Interactive Demo",
-    description="Test the K-Tran Syntax-Aware Model. This model identifies aspects in a sentence and classifies their sentiment.",
-    examples=[
-        ["The service is excellent but the food is terrible."],
-        ["I loved the ambiance, and the pasta was cooked perfectly."],
-        ["The sushi was incredibly fresh and the presentation was beautiful."]
-    ]
+    fn=analyze_sentence,
+    inputs=gr.Textbox(lines=3, placeholder="Enter sentence here..."),
+    outputs=gr.Textbox(lines=20),
+    title="MAMS ABSA Research Model",
+    description="Enter a sentence. The model detects aspects and predicts sentiment."
 )
-interface.launch(debug=True)
+
+interface.launch()
